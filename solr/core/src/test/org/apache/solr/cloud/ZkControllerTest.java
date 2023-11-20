@@ -16,35 +16,24 @@
  */
 package org.apache.solr.cloud;
 
-import static org.apache.solr.common.cloud.ZkStateReader.COLLECTION_PROP;
-import static org.apache.solr.common.cloud.ZkStateReader.SHARD_ID_PROP;
-import static org.apache.solr.common.params.CollectionParams.CollectionAction.ADDREPLICA;
 import static org.mockito.Mockito.mock;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Collections;
-import java.util.List;
-import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.solr.SolrTestCaseJ4;
-import org.apache.solr.common.MapWriter;
 import org.apache.solr.common.cloud.ClusterProperties;
-import org.apache.solr.common.cloud.DocCollection;
 import org.apache.solr.common.cloud.SolrZkClient;
-import org.apache.solr.common.cloud.ZkNodeProps;
 import org.apache.solr.common.cloud.ZkStateReader;
-import org.apache.solr.common.params.CollectionParams;
 import org.apache.solr.common.util.ExecutorUtil;
 import org.apache.solr.common.util.SolrNamedThreadFactory;
-import org.apache.solr.common.util.Utils;
 import org.apache.solr.core.CloudConfig;
 import org.apache.solr.core.CoreContainer;
-import org.apache.solr.core.CoreDescriptor;
 import org.apache.solr.core.PluginInfo;
 import org.apache.solr.core.SolrXmlConfig;
 import org.apache.solr.handler.admin.CoreAdminHandler;
@@ -52,7 +41,6 @@ import org.apache.solr.handler.component.HttpShardHandlerFactory;
 import org.apache.solr.metrics.SolrMetricManager;
 import org.apache.solr.update.UpdateShardHandler;
 import org.apache.solr.update.UpdateShardHandlerConfig;
-import org.apache.solr.util.LogLevel;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.data.Stat;
 import org.junit.AfterClass;
@@ -173,143 +161,6 @@ public class ZkControllerTest extends SolrTestCaseJ4 {
         if (cc != null) {
           cc.shutdown();
         }
-      }
-    } finally {
-      server.shutdown();
-    }
-  }
-
-  @LogLevel(value = "org.apache.solr.cloud=DEBUG;org.apache.solr.cloud.overseer=DEBUG")
-  public void testPublishAndWaitForDownStates() throws Exception {
-
-    /*
-    This test asserts that if zkController.publishAndWaitForDownStates uses only core name to check if all local
-    cores are down then the method will return immediately but if it uses coreNodeName (as it does after SOLR-6665 then
-    the method will time out).
-    We set up the cluster state in such a way that two replicas with same core name exist on non-existent nodes
-    and core container also has a dummy core that has the same core name. The publishAndWaitForDownStates before SOLR-6665
-    would only check the core names and therefore return immediately but after SOLR-6665 it should time out.
-     */
-
-    assumeWorkingMockito();
-    final String collectionName = "testPublishAndWaitForDownStates";
-    Path zkDir = createTempDir(collectionName);
-
-    String nodeName = "127.0.0.1:8983_solr";
-
-    ZkTestServer server = new ZkTestServer(zkDir);
-    try {
-      server.run();
-
-      AtomicReference<ZkController> zkControllerRef = new AtomicReference<>();
-      CoreContainer cc =
-          new MockCoreContainer() {
-            @Override
-            public List<CoreDescriptor> getCoreDescriptors() {
-              CoreDescriptor descriptor =
-                  new CoreDescriptor(
-                      collectionName,
-                      TEST_PATH(),
-                      Collections.emptyMap(),
-                      new Properties(),
-                      zkControllerRef.get());
-              // non-existent coreNodeName, this will cause zkController.publishAndWaitForDownStates
-              // to wait indefinitely when using coreNodeName but usage of core name alone will
-              // return immediately
-              descriptor.getCloudDescriptor().setCoreNodeName("core_node0");
-              return Collections.singletonList(descriptor);
-            }
-          };
-      ZkController zkController = null;
-
-      try {
-        CloudConfig cloudConfig = new CloudConfig.CloudConfigBuilder("127.0.0.1", 8983).build();
-        zkController =
-            new ZkController(cc, server.getZkAddress(), TIMEOUT, cloudConfig, () -> null);
-        zkControllerRef.set(zkController);
-
-        zkController
-            .getZkClient()
-            .makePath(
-                DocCollection.getCollectionPathRoot(collectionName),
-                new byte[0],
-                CreateMode.PERSISTENT,
-                true);
-
-        ZkNodeProps m =
-            new ZkNodeProps(
-                Overseer.QUEUE_OPERATION,
-                CollectionParams.CollectionAction.CREATE.toLower(),
-                ZkStateReader.NODE_NAME_PROP,
-                nodeName,
-                ZkStateReader.NUM_SHARDS_PROP,
-                "1",
-                "name",
-                collectionName);
-        if (zkController.getDistributedClusterStateUpdater().isDistributedStateUpdate()) {
-          zkController
-              .getDistributedClusterStateUpdater()
-              .doSingleStateUpdate(
-                  DistributedClusterStateUpdater.MutatingCommand.ClusterCreateCollection,
-                  m,
-                  zkController.getSolrCloudManager(),
-                  zkController.getZkStateReader());
-        } else {
-          zkController.getOverseerJobQueue().offer(Utils.toJSON(m));
-        }
-
-        MapWriter propMap =
-            ew ->
-                ew.put(Overseer.QUEUE_OPERATION, ADDREPLICA.toLower())
-                    .put(COLLECTION_PROP, collectionName)
-                    .put(SHARD_ID_PROP, "shard1")
-                    .put(ZkStateReader.NODE_NAME_PROP, "non_existent_host:1_")
-                    .put(ZkStateReader.CORE_NAME_PROP, collectionName)
-                    .put(ZkStateReader.STATE_PROP, "active");
-
-        if (zkController.getDistributedClusterStateUpdater().isDistributedStateUpdate()) {
-          zkController
-              .getDistributedClusterStateUpdater()
-              .doSingleStateUpdate(
-                  DistributedClusterStateUpdater.MutatingCommand.SliceAddReplica,
-                  new ZkNodeProps(propMap),
-                  zkController.getSolrCloudManager(),
-                  zkController.getZkStateReader());
-        } else {
-          zkController.getOverseerJobQueue().offer(propMap);
-        }
-
-        propMap =
-            ew ->
-                ew.put(Overseer.QUEUE_OPERATION, ADDREPLICA.toLower())
-                    .put(COLLECTION_PROP, collectionName)
-                    .put(SHARD_ID_PROP, "shard1")
-                    .put(ZkStateReader.NODE_NAME_PROP, "non_existent_host:2_")
-                    .put(ZkStateReader.CORE_NAME_PROP, collectionName)
-                    .put(ZkStateReader.STATE_PROP, "down");
-        if (zkController.getDistributedClusterStateUpdater().isDistributedStateUpdate()) {
-          zkController
-              .getDistributedClusterStateUpdater()
-              .doSingleStateUpdate(
-                  DistributedClusterStateUpdater.MutatingCommand.SliceAddReplica,
-                  new ZkNodeProps(propMap),
-                  zkController.getSolrCloudManager(),
-                  zkController.getZkStateReader());
-        } else {
-          zkController.getOverseerJobQueue().offer(propMap);
-        }
-
-        zkController.getZkStateReader().forciblyRefreshAllClusterStateSlow();
-
-        long now = System.nanoTime();
-        long timeout = now + TimeUnit.NANOSECONDS.convert(5, TimeUnit.SECONDS);
-        zkController.publishAndWaitForDownStates(5);
-        assertTrue(
-            "The ZkController.publishAndWaitForDownStates should have timed out but it didn't",
-            System.nanoTime() >= timeout);
-      } finally {
-        if (zkController != null) zkController.close();
-        cc.shutdown();
       }
     } finally {
       server.shutdown();

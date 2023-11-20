@@ -28,11 +28,13 @@ import static org.apache.solr.common.cloud.ZkStateReader.UNSUPPORTED_SOLR_XML;
 import static org.apache.solr.common.params.CollectionParams.CollectionAction.ADDROLE;
 import static org.apache.zookeeper.ZooDefs.Ids.OPEN_ACL_UNSAFE;
 
+import com.google.common.annotations.VisibleForTesting;
 import java.io.Closeable;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Array;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -1103,47 +1105,77 @@ public class ZkController implements Closeable {
     publishAndWaitForDownStates(WAIT_DOWN_STATES_TIMEOUT_SECONDS);
   }
 
-  public void publishAndWaitForDownStates(int timeoutSeconds)
-      throws KeeperException, InterruptedException {
-
+  public void publishAndWaitForDownStates(int timeoutSeconds) throws InterruptedException {
     publishNodeAsDown(getNodeName());
+    waitForDownStates(timeoutSeconds);
+  }
 
+  @VisibleForTesting
+  void waitForDownStates(int timeoutSeconds) throws InterruptedException {
     Set<String> collectionsWithLocalReplica = ConcurrentHashMap.newKeySet();
-    for (CoreDescriptor descriptor : cc.getCoreDescriptors()) {
-      collectionsWithLocalReplica.add(descriptor.getCloudDescriptor().getCollectionName());
-    }
+    Map<String, DocCollection> collectionMap = getClusterState().getCollectionsMap();
+    collectionMap.forEach(
+        (n, c) -> {
+          if (c.getReplicas().stream().anyMatch(r -> r.getNodeName().equals(nodeName))) {
+            collectionsWithLocalReplica.add(n);
+          }
+        });
 
-    CountDownLatch latch = new CountDownLatch(collectionsWithLocalReplica.size());
-    for (String collectionWithLocalReplica : collectionsWithLocalReplica) {
-      zkStateReader.registerDocCollectionWatcher(
-          collectionWithLocalReplica,
-          (collectionState) -> {
-            if (collectionState == null) return false;
-            boolean foundStates = true;
-            for (CoreDescriptor coreDescriptor : cc.getCoreDescriptors()) {
-              if (coreDescriptor
-                  .getCloudDescriptor()
-                  .getCollectionName()
-                  .equals(collectionWithLocalReplica)) {
-                Replica replica =
-                    collectionState.getReplica(
-                        coreDescriptor.getCloudDescriptor().getCoreNodeName());
-                if (replica == null || replica.getState() != Replica.State.DOWN) {
-                  foundStates = false;
+    if (log.isInfoEnabled()) {
+      log.info(
+          "DOWNNODE: There are {} collections with replicas hosted on this node",
+          collectionsWithLocalReplica.size());
+    }
+    if (!collectionsWithLocalReplica.isEmpty()) {
+      CountDownLatch latch = new CountDownLatch(collectionsWithLocalReplica.size());
+      for (String collectionWithLocalReplica : collectionsWithLocalReplica) {
+        zkStateReader.registerDocCollectionWatcher(
+            collectionWithLocalReplica,
+            (collectionState) -> {
+              if (collectionState == null) {
+                return false;
+              }
+              boolean allCollectionReplicasDown =
+                  collectionState.getReplicas().stream()
+                      .noneMatch(
+                          r ->
+                              r.getNodeName().equals(nodeName)
+                                  && !r.getState().equals(Replica.State.DOWN));
+              if (!allCollectionReplicasDown) {
+                if (log.isInfoEnabled()) {
+                  log.info(
+                      "DOWNNODE: collection {} still has at least 1 remaining replica that is not down",
+                      collectionState.getName());
+                }
+              } else {
+                if (log.isInfoEnabled()) {
+                  log.info(
+                      "DOWNNODE: All Replicas are published DOWN for collection {}",
+                      collectionState.getName());
+                }
+                if (collectionsWithLocalReplica.remove(collectionState.getName())) {
+                  if (log.isInfoEnabled()) {
+                    log.info("DOWNNODE: Counting down latch");
+                  }
+                  latch.countDown();
                 }
               }
-            }
+              return allCollectionReplicasDown;
+            });
+      }
 
-            if (foundStates && collectionsWithLocalReplica.remove(collectionWithLocalReplica)) {
-              latch.countDown();
-            }
-            return foundStates;
-          });
-    }
-
-    boolean allPublishedDown = latch.await(timeoutSeconds, TimeUnit.SECONDS);
-    if (!allPublishedDown) {
-      log.warn("Timed out waiting to see all nodes published as DOWN in our cluster state.");
+      Instant startWait = Instant.now();
+      boolean allPublishedDown = latch.await(timeoutSeconds, TimeUnit.SECONDS);
+      if (!allPublishedDown) {
+        if (log.isWarnEnabled()) {
+          log.warn(
+              "DOWNNODE: Timed out waiting to see all nodes published as DOWN in our cluster state.");
+        }
+      } else if (log.isInfoEnabled()) {
+        log.info(
+            "DOWNNODE: All replicas are published as DOWN, waited {}ms to observe this",
+            Instant.now().toEpochMilli() - startWait.toEpochMilli());
+      }
     }
   }
 
